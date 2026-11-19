@@ -1,0 +1,66 @@
+name: One Fusion GSI - download and inspect
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onefusion-gsi-inspect
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check runner storage
+        run: |
+          df -h /
+          free -h
+
+      - name: Read source URLs
+        id: sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          source config/gsi.env
+          source config/gapps.env
+          echo "gsi_url=$GSI_URL" >> "$GITHUB_OUTPUT"
+          echo "gapps_url=$GAPPS_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Download and inspect GSI
+        env:
+          GSI_URL: ${{ steps.sources.outputs.gsi_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports work
+          curl -fL --retry 3 --connect-timeout 30 "$GSI_URL" -o work/system.img.gz
+          gzip -t work/system.img.gz
+          sha256sum work/system.img.gz | tee reports/gsi-download.sha256
+          gzip -dc work/system.img.gz > work/system.img
+          rm work/system.img.gz
+          file work/system.img | tee reports/gsi-file.txt
+          ls -lh work/system.img | tee reports/gsi-size.txt
+          df -h / | tee reports/storage-after-gsi.txt
+
+      - name: Download and inspect MindTheGapps archive
+        env:
+          GAPPS_URL: ${{ steps.sources.outputs.gapps_url }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 30 "$GAPPS_URL" -o work/MindTheGapps.zip
+          unzip -t work/MindTheGapps.zip | tail -n 3 | tee reports/gapps-zip-test.txt
+          sha256sum work/MindTheGapps.zip | tee reports/gapps-download.sha256
+          unzip -l work/MindTheGapps.zip > reports/gapps-file-list.txt
+          sed -n '1,100p' reports/gapps-file-list.txt
+          df -h / | tee reports/storage-after-gapps.txt
+
+      - name: Upload inspection report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: onefusion-gsi-inspection
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
