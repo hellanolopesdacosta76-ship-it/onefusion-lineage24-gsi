@@ -80,10 +80,11 @@ jobs:
           dumpe2fs -h gsi/system.img > reports/gsi-filesystem-header.txt 2>&1 || true
           mkdir -p gsi/mnt
           if sudo mount -o loop,ro,noload gsi/system.img gsi/mnt 2>reports/gsi-mount-errors.txt; then
-            find gsi/mnt -maxdepth 4 -type f \( -name build.prop -o -name '*.prop' \) -print > reports/gsi-property-files.txt
-            find gsi/mnt -maxdepth 4 -type f \( -name build.prop -o -name '*.prop' \) -exec grep -HnE '^(ro\.(build|product|vendor|system|vndk)|ro\.treble|ro\.vndk|ro\.zygote|ro\.product\.cpu\.abi|ro\.build\.version\.sdk|ro\.build\.version\.release)' {} \; > reports/gsi-android-properties.txt || true
-            find gsi/mnt -maxdepth 4 -type d \( -name 'lib' -o -name 'lib64' -o -name 'bin' -o -name 'etc' -o -name 'framework' \) -print > reports/gsi-key-directories.txt
-            find gsi/mnt/system/lib gsi/mnt/system/lib64 gsi/mnt/system_ext/lib gsi/mnt/system_ext/lib64 -maxdepth 1 -type f 2>/dev/null | wc -l > reports/gsi-native-library-counts.txt || true
+            # The mounted Android image belongs to root; inspect it with sudo to avoid permission-denied exits.
+            sudo find gsi/mnt -maxdepth 4 -type f \( -name build.prop -o -name '*.prop' \) -print > reports/gsi-property-files.txt
+            sudo find gsi/mnt -maxdepth 4 -type f \( -name build.prop -o -name '*.prop' \) -exec grep -HnE '^(ro\.(build|product|vendor|system|vndk)|ro\.treble|ro\.vndk|ro\.zygote|ro\.product\.cpu\.abi|ro\.build\.version\.sdk|ro\.build\.version\.release)' {} \; > reports/gsi-android-properties.txt 2>reports/gsi-property-scan-errors.txt || true
+            sudo find gsi/mnt -maxdepth 4 -type d \( -name 'lib' -o -name 'lib64' -o -name 'bin' -o -name 'etc' -o -name 'framework' \) -print > reports/gsi-key-directories.txt
+            sudo find gsi/mnt/system/lib gsi/mnt/system/lib64 gsi/mnt/system_ext/lib gsi/mnt/system_ext/lib64 -maxdepth 1 -type f 2>/dev/null | wc -l > reports/gsi-native-library-counts.txt || true
             sudo umount gsi/mnt
           else
             debugfs -R 'stats' gsi/system.img > reports/gsi-debugfs-stats.txt 2>&1 || true
