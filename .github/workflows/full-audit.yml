@@ -18,10 +18,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Prepare report directory
+        run: mkdir -p reports
+
       - name: Install inspection tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs unzip zipinfo android-sdk-libsparse-utils file
+          # zipinfo is provided by the unzip package; it is not a separate Ubuntu package.
+          sudo apt-get install -y e2fsprogs unzip android-sdk-libsparse-utils file
           python3 -m pip install --user --break-system-packages gdown
 
       - name: Read download sources
@@ -152,6 +156,7 @@ jobs:
       - name: Build audit summary and upload reports
         if: always()
         run: |
+          mkdir -p reports
           {
             echo "FULL AUDIT SUMMARY"
             echo "GSI properties:"
