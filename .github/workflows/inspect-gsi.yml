@@ -30,8 +30,10 @@ jobs:
           set -euo pipefail
           source config/gsi.env
           source config/gapps.env
+          source config/stock.env
           echo "gsi_url=$GSI_URL" >> "$GITHUB_OUTPUT"
           echo "gapps_url=$GAPPS_URL" >> "$GITHUB_OUTPUT"
+          echo "stock_id=$STOCKROM_DRIVE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Download and inspect GSI
         env:
@@ -59,6 +61,24 @@ jobs:
           unzip -l work/MindTheGapps.zip > reports/gapps-file-list.txt
           sed -n '1,100p' reports/gapps-file-list.txt
           df -h / | tee reports/storage-after-gapps.txt
+
+      - name: Download and inspect Motorola stock ROM
+        env:
+          STOCK_ID: ${{ steps.sources.outputs.stock_id }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --break-system-packages gdown
+          mkdir -p stock
+          gdown --id "$STOCK_ID" -O stock/stockrom
+          test -s stock/stockrom
+          file stock/stockrom | tee reports/stock-file.txt
+          ls -lh stock/stockrom | tee reports/stock-size.txt
+          case "$(file -b stock/stockrom)" in
+            *Zip*) unzip -Z1 stock/stockrom | head -n 100 > reports/stock-contents.txt ;;
+            *gzip*|*XZ*|*tar*) tar -tf stock/stockrom | head -n 100 > reports/stock-contents.txt || true ;;
+            *) echo "Formato não identificado automaticamente; arquivo preservado para análise." > reports/stock-contents.txt ;;
+          esac
+          df -h / | tee reports/storage-after-stock.txt
 
       - name: Upload inspection report only
         uses: actions/upload-artifact@v4
