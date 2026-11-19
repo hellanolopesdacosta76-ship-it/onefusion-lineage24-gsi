@@ -1,0 +1,77 @@
+name: Motorola One Fusion - inspect stock ROM only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onefusion-stock-inspect
+  cancel-in-progress: true
+
+jobs:
+  inspect-stock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read stock ROM source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source config/stock.env
+          echo "drive_id=$STOCKROM_DRIVE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Check runner capacity
+        run: |
+          df -h /
+          free -h
+
+      - name: Download Motorola stock ROM from Google Drive
+        env:
+          STOCK_ID: ${{ steps.source.outputs.drive_id }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --break-system-packages gdown
+          mkdir -p stock reports
+          python3 -m gdown "https://drive.google.com/uc?id=${STOCK_ID}" -O stock/stockrom
+          test -s stock/stockrom
+          file stock/stockrom | tee reports/stock-file.txt
+          ls -lh stock/stockrom | tee reports/stock-size.txt
+          sha256sum stock/stockrom | tee reports/stock-sha256.txt
+          df -h / | tee reports/storage-after-download.txt
+
+      - name: Inspect archive and identify Motorola firmware images
+        shell: bash
+        run: |
+          set -euo pipefail
+          if unzip -t stock/stockrom >/dev/null 2>&1; then
+            echo "Formato: ZIP válido" | tee reports/stock-format.txt
+            unzip -Z1 stock/stockrom > reports/stock-contents.txt
+            echo "Arquivos importantes encontrados:" | tee reports/motorola-images.txt
+            grep -Ei '(^|/)(flashfile\.xml|servicefile\.xml|.*\.img|.*\.bin|.*\.mbn|.*\.elf|.*\.xml)$' reports/stock-contents.txt | head -n 250 | tee -a reports/motorola-images.txt || true
+            echo "Identificação de modelo/região/build (se presente nos XML):" | tee reports/firmware-metadata.txt
+            while IFS= read -r entry; do
+              case "$entry" in
+                *.xml|*.XML)
+                  unzip -p stock/stockrom "$entry" 2>/dev/null | grep -Eio 'XT[0-9]{4}-[0-9]|ASTRO|RETBR|RPLS[^ <"]*|subsidy-[^ <"]*' | sort -u || true
+                  ;;
+              esac
+            done < <(grep -Ei '\.xml$' reports/stock-contents.txt | head -n 20) | sort -u | tee -a reports/firmware-metadata.txt
+          else
+            echo "O arquivo baixado não passou na validação ZIP." | tee reports/stock-format.txt
+            echo "Possível página de erro, confirmação do Google Drive ou outro formato." | tee reports/stock-contents.txt
+            head -c 500 stock/stockrom | strings | head -n 20 | tee reports/stock-preview.txt || true
+          fi
+
+      - name: Upload stock inspection reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: onefusion-stock-inspection
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
