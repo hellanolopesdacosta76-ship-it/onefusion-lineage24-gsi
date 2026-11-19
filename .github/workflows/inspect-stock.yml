@@ -23,7 +23,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source config/stock.env
+          STOCKROM_DRIVE_ID="$(grep '^STOCKROM_DRIVE_ID=' config/stock.env | head -n 1 | cut -d= -f2-)"
+          test -n "$STOCKROM_DRIVE_ID"
           echo "drive_id=$STOCKROM_DRIVE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Check runner capacity
