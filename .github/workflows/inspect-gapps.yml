@@ -1,0 +1,67 @@
+name: MindTheGapps - download and inspect only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onefusion-gapps-inspect
+  cancel-in-progress: true
+
+jobs:
+  inspect-gapps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read MindTheGapps URL
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          GAPPS_URL="$(grep '^GAPPS_URL=' config/gapps.env | head -n 1 | cut -d= -f2-)"
+          test -n "$GAPPS_URL"
+          echo "url=$GAPPS_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Download MindTheGapps Android 17 ARM64
+        env:
+          GAPPS_URL: ${{ steps.source.outputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work reports
+          curl -fL --retry 3 --connect-timeout 30 "$GAPPS_URL" -o work/MindTheGapps.zip
+          test -s work/MindTheGapps.zip
+          unzip -t work/MindTheGapps.zip | tail -n 3 | tee reports/gapps-zip-test.txt
+          file work/MindTheGapps.zip | tee reports/gapps-file.txt
+          ls -lh work/MindTheGapps.zip | tee reports/gapps-size.txt
+          sha256sum work/MindTheGapps.zip | tee reports/gapps-sha256.txt
+
+      - name: Inspect package structure and installer
+        run: |
+          set -euo pipefail
+          unzip -Z1 work/MindTheGapps.zip > reports/gapps-contents.txt
+          grep -Ei '(^|/)(updater-script|update-binary|install\.sh|.*\.sh|.*\.prop|.*\.rc)$|system/(app|priv-app|framework|etc)' reports/gapps-contents.txt | head -n 250 > reports/gapps-relevant-files.txt || true
+          {
+            while IFS= read -r entry; do
+              case "$entry" in
+                *updater-script|*install.sh)
+                  echo "===== $entry ====="
+                  unzip -p work/MindTheGapps.zip "$entry" 2>/dev/null | head -n 250 || true
+                  ;;
+              esac
+            done < reports/gapps-contents.txt
+          } > reports/gapps-installer-preview.txt
+          echo "Package validated; contents and installer preview generated." | tee reports/inspection-result.txt
+          df -h / | tee reports/runner-storage.txt
+
+      - name: Upload MindTheGapps inspection reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: onefusion-gapps-inspection
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
