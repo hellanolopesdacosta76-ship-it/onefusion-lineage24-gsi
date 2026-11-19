@@ -1,0 +1,195 @@
+name: One Fusion - exhaustive firmware and kernel audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onefusion-kernel-audit
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install forensic tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs unzip zipinfo file binutils cpio lz4 zstd device-tree-compiler android-sdk-libsparse-utils python3-pip git
+          python3 -m pip install --user --break-system-packages gdown
+          df -h /
+          free -h
+
+      - name: Fetch AOSP boot image unpacker
+        run: |
+          git clone --depth=1 https://github.com/LineageOS/android_system_tools_mkbootimg.git tools/mkbootimg || git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg tools/mkbootimg
+          test -f tools/mkbootimg/unpack_bootimg.py
+
+      - name: Read source locations
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          GSI_URL="$(grep '^GSI_URL=' config/gsi.env | head -n 1 | cut -d= -f2-)"
+          GAPPS_URL="$(grep '^GAPPS_URL=' config/gapps.env | head -n 1 | cut -d= -f2-)"
+          STOCK_ID="$(grep '^STOCKROM_DRIVE_ID=' config/stock.env | head -n 1 | cut -d= -f2-)"
+          test -n "$GSI_URL" && test -n "$GAPPS_URL" && test -n "$STOCK_ID"
+          echo "gsi_url=$GSI_URL" >> "$GITHUB_OUTPUT"
+          echo "gapps_url=$GAPPS_URL" >> "$GITHUB_OUTPUT"
+          echo "stock_id=$STOCK_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download and validate source archives
+        env:
+          GSI_URL: ${{ steps.source.outputs.gsi_url }}
+          GAPPS_URL: ${{ steps.source.outputs.gapps_url }}
+          STOCK_ID: ${{ steps.source.outputs.stock_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p input reports extracted/stock extracted/gsi extracted/gapps work
+          curl -fL --retry 3 --connect-timeout 30 "$GSI_URL" -o input/gsi.img.gz
+          curl -fL --retry 3 --connect-timeout 30 "$GAPPS_URL" -o input/MindTheGapps.zip
+          python3 -m gdown "https://drive.google.com/uc?id=$STOCK_ID" -O input/stockrom.zip
+          gzip -t input/gsi.img.gz
+          unzip -t input/MindTheGapps.zip >/dev/null
+          unzip -t input/stockrom.zip >/dev/null
+          sha256sum input/* | tee reports/source-sha256.txt
+          file input/* | tee reports/source-types.txt
+          ls -lh input | tee reports/source-sizes.txt
+
+      - name: Extract every file from stock firmware archive
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import zipfile, os
+          z=zipfile.ZipFile("input/stockrom.zip")
+          root=os.path.realpath("extracted/stock")
+          rows=[]
+          for info in z.infolist():
+              name=info.filename
+              if not name or name.endswith("/"): continue
+              target=os.path.realpath(os.path.join(root,name))
+              if not target.startswith(root+os.sep): raise SystemExit("Unsafe archive path: "+name)
+              os.makedirs(os.path.dirname(target),exist_ok=True)
+              with z.open(info) as src, open(target,"wb") as dst:
+                  while True:
+                      block=src.read(8*1024*1024)
+                      if not block: break
+                      dst.write(block)
+              rows.append((name,info.file_size))
+          with open("reports/stock-extracted-inventory.tsv","w") as f:
+              for name,size in rows: f.write(f"{size}\t{name}\n")
+          print(f"Extracted {len(rows)} files")
+          PY
+          find extracted/stock -type f -printf '%s\t%p\n' | sort -n > reports/stock-filesystem-inventory.tsv
+          find extracted/stock -type f -exec file {} \; > reports/stock-file-types.txt
+          find extracted/stock -type f \( -iname '*.img' -o -iname '*.bin' -o -iname '*.mbn' -o -iname '*.elf' -o -iname '*.dtb' -o -iname '*.dtbo' -o -iname '*.xml' -o -iname '*.bat' -o -iname '*.sh' \) -printf '%p\n' | sort > reports/stock-firmware-components.txt
+
+      - name: Inspect manifests and device identity
+        run: |
+          set -euo pipefail
+          grep -RniE 'XT[0-9]{4}-[0-9]|ASTRO|RETBR|RPLS|product|model|sku|channel|partition|filename|flash|fastboot|erase|sparse' extracted/stock --include='*.xml' --include='*.txt' --include='*.bat' --include='*.sh' > reports/stock-manifest-identifiers.txt || true
+          grep -RniE 'XT[0-9]{4}-[0-9]|ASTRO|RETBR|RPLS' extracted/stock --include='*.xml' --include='*.txt' --include='*.bat' --include='*.sh' | head -n 200 > reports/stock-model-build-summary.txt || true
+
+      - name: Inspect stock boot image and kernel
+        run: |
+          set -euo pipefail
+          mkdir -p work/boot
+          find extracted/stock -type f -iname 'boot.img' -print > reports/boot-image-paths.txt
+          while IFS= read -r boot; do
+            [ -n "$boot" ] || continue
+            name="$(echo "$boot" | tr '/ ' '__')"
+            out="work/boot/$name"
+            mkdir -p "$out"
+            python3 tools/mkbootimg/unpack_bootimg.py --boot_img "$boot" --out "$out" --format=mkbootimg > "reports/$name-unpack.txt" 2>&1 || python3 tools/mkbootimg/unpack_bootimg.py --boot_img "$boot" --out "$out" > "reports/$name-unpack.txt" 2>&1 || true
+            find "$out" -type f -maxdepth 2 -exec file {} \; > "reports/$name-components.txt"
+            for k in "$out"/kernel "$out"/*kernel*; do
+              [ -f "$k" ] || continue
+              strings "$k" | grep -Ei 'Linux version|gcc version|clang version|CONFIG_LOCALVERSION|androidboot|exynos|qcom|msm|kona|lito|kernel' | head -n 250 > "reports/$name-kernel-strings.txt" || true
+              strings "$k" | grep -Eo 'Linux version [^ ]+' | head -n 5 >> "reports/$name-kernel-strings.txt" || true
+            done
+            find "$out" -type f \( -name '*.dtb' -o -name '*.dtbo' \) -exec sh -c 'for f do echo "===== $f ====="; dtc -I dtb -O dts "$f" 2>/dev/null | grep -Ei "model|compatible|qcom|motorola|astro|board" | head -n 100; done' sh {} + > "reports/$name-device-tree-hints.txt" || true
+          done < reports/boot-image-paths.txt
+
+      - name: Inspect vendor ODM and system partition filesystems
+        run: |
+          set -euo pipefail
+          mkdir -p work/partitions
+          find extracted/stock -type f \( -iname 'vendor.img' -o -iname 'odm.img' -o -iname 'system.img' -o -iname 'product.img' -o -iname 'system_ext.img' -o -iname 'super.img' \) -print > reports/stock-partition-paths.txt
+          while IFS= read -r img; do
+            [ -n "$img" ] || continue
+            base="$(basename "$img")"
+            safe="$(echo "$img" | tr '/ ' '__')"
+            actual="$img"
+            if file "$img" | grep -qi 'Android sparse'; then
+              actual="work/partitions/$safe.raw"
+              simg2img "$img" "$actual" || { echo "simg2img failed: $img" >> reports/partition-errors.txt; continue; }
+            fi
+            file "$actual" > "reports/$safe-file.txt"
+            dumpe2fs -h "$actual" > "reports/$safe-fs-header.txt" 2>&1 || true
+            mnt="work/partitions/mnt-$safe"
+            mkdir -p "$mnt"
+            if sudo mount -o loop,ro,noload "$actual" "$mnt" 2>/dev/null; then
+              find "$mnt" -type f \( -name '*.prop' -o -name '*.rc' -o -name 'fstab*' -o -name '*.ko' -o -name '*.xml' \) -printf '%p\n' | sed "s|$mnt/||" > "reports/$safe-important-files.txt"
+              grep -RniE 'ro\.(build|product|vendor|system|vndk)|ro\.treble|ro\.vndk|ro\.zygote|ro\.product\.cpu\.abi|ro\.build\.version|ro\.vendor\.build|fstab|mount_all|insmod|modprobe|modules\.load|kernel' "$mnt" --include='*.prop' --include='*.rc' --include='fstab*' --include='*.conf' --include='modules.load' > "reports/$safe-android-config-hits.txt" || true
+              find "$mnt" -type f -name '*.ko' -exec sh -c 'for f do echo "===== $f ====="; modinfo "$f" 2>/dev/null | grep -E "^(filename|version|vermagic|depends|name):" || strings "$f" | grep -E "vermagic=|depends=" | head -n 5; done' sh {} + > "reports/$safe-kernel-modules.txt" || true
+              sudo umount "$mnt"
+            else
+              echo "Could not mount as ext filesystem: $img" >> reports/partition-errors.txt
+            fi
+          done < reports/stock-partition-paths.txt
+
+      - name: Inspect GSI and GApps contents
+        run: |
+          set -euo pipefail
+          gzip -dc input/gsi.img.gz > extracted/gsi/system.img
+          file extracted/gsi/system.img > reports/gsi-image-type.txt
+          dumpe2fs -h extracted/gsi/system.img > reports/gsi-filesystem-header.txt 2>&1 || true
+          mkdir -p work/gsi-mnt
+          if sudo mount -o loop,ro,noload extracted/gsi/system.img work/gsi-mnt 2>/dev/null; then
+            find work/gsi-mnt -type f \( -name build.prop -o -name '*.prop' \) -exec grep -HnE '^(ro\.(build|product|vendor|system|vndk)|ro\.treble|ro\.vndk|ro\.zygote|ro\.product\.cpu\.abi|ro\.build\.version)' {} \; > reports/gsi-properties.txt || true
+            find work/gsi-mnt -type d \( -name lib -o -name lib64 -o -name bin -o -name framework \) -print > reports/gsi-layout.txt
+            sudo umount work/gsi-mnt
+          else
+            debugfs -R 'ls -l /' extracted/gsi/system.img > reports/gsi-root-listing.txt 2>&1 || true
+          fi
+          unzip -Z1 input/MindTheGapps.zip > reports/gapps-file-list.txt
+          zipinfo -l input/MindTheGapps.zip > reports/gapps-archive-details.txt
+          mkdir -p work/gapps-meta
+          while IFS= read -r entry; do
+            case "$entry" in
+              *updater-script|*install.sh|*\.prop|*\.rc|*\.xml)
+                safe="$(echo "$entry" | tr '/' '_')"
+                unzip -p input/MindTheGapps.zip "$entry" > "work/gapps-meta/$safe" 2>/dev/null || true
+                ;;
+            esac
+          done < <(grep -Ei '(updater-script|install\.sh|\.prop$|\.rc$|\.xml$)' reports/gapps-file-list.txt | head -n 150)
+          grep -RniE 'arm64|sdk|android|api|assert|mount|system|product|vendor|zygote|vndk|space|size' work/gapps-meta > reports/gapps-installer-config-hits.txt || true
+
+      - name: Generate audit findings
+        if: always()
+        run: |
+          {
+            echo "ONE FUSION - FIRMWARE AND KERNEL AUDIT"
+            echo "Source checksums:"; cat reports/source-sha256.txt 2>/dev/null || true
+            echo; echo "Stock identity:"; cat reports/stock-model-build-summary.txt 2>/dev/null | head -n 200 || true
+            echo; echo "Firmware components:"; cat reports/stock-firmware-components.txt 2>/dev/null || true
+            echo; echo "Stock partition paths:"; cat reports/stock-partition-paths.txt 2>/dev/null || true
+            echo; echo "Boot image paths:"; cat reports/boot-image-paths.txt 2>/dev/null || true
+            echo; echo "GSI properties:"; cat reports/gsi-properties.txt 2>/dev/null || true
+            echo; echo "Partition errors:"; cat reports/partition-errors.txt 2>/dev/null || true
+          } > reports/FINAL-AUDIT.txt
+
+      - name: Upload forensic reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onefusion-kernel-forensic-audit
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
