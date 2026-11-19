@@ -1,0 +1,180 @@
+name: One Fusion - full compatibility audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onefusion-full-audit
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs unzip zipinfo android-sdk-libsparse-utils file
+          python3 -m pip install --user --break-system-packages gdown
+
+      - name: Read download sources
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          GSI_URL="$(grep '^GSI_URL=' config/gsi.env | head -n 1 | cut -d= -f2-)"
+          GAPPS_URL="$(grep '^GAPPS_URL=' config/gapps.env | head -n 1 | cut -d= -f2-)"
+          STOCK_ID="$(grep '^STOCKROM_DRIVE_ID=' config/stock.env | head -n 1 | cut -d= -f2-)"
+          test -n "$GSI_URL" && test -n "$GAPPS_URL" && test -n "$STOCK_ID"
+          echo "gsi_url=$GSI_URL" >> "$GITHUB_OUTPUT"
+          echo "gapps_url=$GAPPS_URL" >> "$GITHUB_OUTPUT"
+          echo "stock_id=$STOCK_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download all three source packages
+        env:
+          GSI_URL: ${{ steps.source.outputs.gsi_url }}
+          GAPPS_URL: ${{ steps.source.outputs.gapps_url }}
+          STOCK_ID: ${{ steps.source.outputs.stock_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p input reports stock gsi gapps
+          curl -fL --retry 3 --connect-timeout 30 "$GSI_URL" -o input/gsi.img.gz
+          curl -fL --retry 3 --connect-timeout 30 "$GAPPS_URL" -o input/MindTheGapps.zip
+          python3 -m gdown "https://drive.google.com/uc?id=$STOCK_ID" -O input/stockrom.zip
+          test -s input/gsi.img.gz && test -s input/MindTheGapps.zip && test -s input/stockrom.zip
+          gzip -t input/gsi.img.gz
+          unzip -t input/MindTheGapps.zip >/dev/null
+          unzip -t input/stockrom.zip >/dev/null
+          sha256sum input/* | tee reports/source-sha256.txt
+          file input/* | tee reports/source-file-types.txt
+          ls -lh input | tee reports/source-sizes.txt
+          df -h / | tee reports/storage-after-download.txt
+
+      - name: Inspect GSI filesystem and Android properties
+        run: |
+          set -euo pipefail
+          gzip -dc input/gsi.img.gz > gsi/system.img
+          file gsi/system.img | tee reports/gsi-image-type.txt
+          ls -lh gsi/system.img | tee reports/gsi-image-size.txt
+          dumpe2fs -h gsi/system.img > reports/gsi-filesystem-header.txt 2>&1 || true
+          mkdir -p gsi/mnt
+          if sudo mount -o loop,ro,noload gsi/system.img gsi/mnt 2>reports/gsi-mount-errors.txt; then
+            find gsi/mnt -maxdepth 4 -type f \( -name build.prop -o -name '*.prop' \) -print > reports/gsi-property-files.txt
+            find gsi/mnt -maxdepth 4 -type f \( -name build.prop -o -name '*.prop' \) -exec grep -HnE '^(ro\.(build|product|vendor|system|vndk)|ro\.treble|ro\.vndk|ro\.zygote|ro\.product\.cpu\.abi|ro\.build\.version\.sdk|ro\.build\.version\.release)' {} \; > reports/gsi-android-properties.txt || true
+            find gsi/mnt -maxdepth 4 -type d \( -name 'lib' -o -name 'lib64' -o -name 'bin' -o -name 'etc' -o -name 'framework' \) -print > reports/gsi-key-directories.txt
+            find gsi/mnt/system/lib gsi/mnt/system/lib64 gsi/mnt/system_ext/lib gsi/mnt/system_ext/lib64 -maxdepth 1 -type f 2>/dev/null | wc -l > reports/gsi-native-library-counts.txt || true
+            sudo umount gsi/mnt
+          else
+            debugfs -R 'stats' gsi/system.img > reports/gsi-debugfs-stats.txt 2>&1 || true
+            debugfs -R 'ls -l /' gsi/system.img > reports/gsi-root-listing.txt 2>&1 || true
+          fi
+
+      - name: Inspect stock firmware manifest and partition inventory
+        run: |
+          set -euo pipefail
+          unzip -Z1 input/stockrom.zip > reports/stock-full-file-list.txt
+          zipinfo -l input/stockrom.zip > reports/stock-zip-details.txt
+          grep -Ei '(^|/)(flashfile\.xml|servicefile\.xml|.*\.img|.*\.bin|.*\.mbn|.*\.elf|.*\.xml)$' reports/stock-full-file-list.txt > reports/stock-partition-and-xml-files.txt || true
+          mkdir -p stock/xml stock/images
+          while IFS= read -r entry; do
+            case "$entry" in
+              *.xml|*.XML)
+                base="$(basename "$entry")"
+                unzip -p input/stockrom.zip "$entry" > "stock/xml/$base" 2>/dev/null || true
+                ;;
+            esac
+          done < <(grep -Ei '\.xml$' reports/stock-full-file-list.txt | head -n 50)
+          grep -RniE 'XT[0-9]{4}-[0-9]|ASTRO|RETBR|RPLS|build|model|sku|channel|partition|filename|step operation|oem' stock/xml > reports/stock-manifest-identifiers.txt || true
+          python3 - <<'PY'
+          import zipfile, os, re
+          z=zipfile.ZipFile("input/stockrom.zip")
+          wanted=re.compile(r'(^|/)(boot|vendor|odm|dtbo|vbmeta|vbmeta_system|super|system|product|system_ext|recovery|logo|persist|metadata|vendor_boot|vendor_dlkm|system_dlkm)\.img$',re.I)
+          extracted=[]
+          for info in z.infolist():
+              if wanted.search(info.filename):
+                  name=os.path.basename(info.filename)
+                  target=os.path.join("stock/images",name)
+                  with z.open(info) as src, open(target,"wb") as dst:
+                      while True:
+                          b=src.read(8*1024*1024)
+                          if not b: break
+                          dst.write(b)
+                  extracted.append((info.filename, info.file_size, target))
+          with open("reports/stock-selected-images.txt","w") as f:
+              for src,size,target in extracted: f.write(f"{src}\t{size}\t{target}\n")
+          PY
+          find stock/images -type f -exec file {} \; > reports/stock-image-types.txt
+          find stock/images -type f -printf '%f %s bytes\n' | sort > reports/stock-image-sizes.txt
+          for img in stock/images/*.img; do
+            [ -e "$img" ] || continue
+            base="$(basename "$img")"
+            if file "$img" | grep -qi 'Android sparse'; then
+              simg_dump "$img" > "reports/sparse-$base.txt" 2>&1 || true
+            fi
+          done
+          df -h / | tee reports/storage-after-stock-inspection.txt
+
+      - name: Inspect MindTheGapps archive, metadata and installer
+        run: |
+          set -euo pipefail
+          unzip -Z1 input/MindTheGapps.zip > reports/gapps-full-file-list.txt
+          zipinfo -l input/MindTheGapps.zip > reports/gapps-zip-details.txt
+          grep -Ei '(^|/)(updater-script|update-binary|install\.sh|.*\.prop|.*\.rc|.*\.xml)$|system/(app|priv-app|framework|etc)' reports/gapps-full-file-list.txt | head -n 500 > reports/gapps-relevant-files.txt || true
+          mkdir -p gapps/meta
+          while IFS= read -r entry; do
+            case "$entry" in
+              *updater-script|*install.sh|*\.prop|*\.rc|*\.xml)
+                base="$(echo "$entry" | tr '/' '_')"
+                unzip -p input/MindTheGapps.zip "$entry" > "gapps/meta/$base" 2>/dev/null || true
+                ;;
+            esac
+          done < <(grep -Ei '(updater-script|install\.sh|\.prop$|\.rc$|\.xml$)' reports/gapps-full-file-list.txt | head -n 100)
+          grep -RniE 'arm64|arm|sdk|android|api|assert|mount|system|product|vendor|zygote|vndk|space|size' gapps/meta > reports/gapps-installer-and-metadata-hits.txt || true
+          python3 - <<'PY'
+          import zipfile, re
+          z=zipfile.ZipFile("input/MindTheGapps.zip")
+          names=z.namelist()
+          with open("reports/gapps-package-summary.txt","w") as f:
+              f.write(f"entries={len(names)}\n")
+              f.write(f"uncompressed_bytes={sum(i.file_size for i in z.infolist())}\n")
+              f.write(f"compressed_bytes={sum(i.compress_size for i in z.infolist())}\n")
+              for term in ["arm64","arm","priv-app","framework","permissions","setupwizard","google"]:
+                  f.write(f"{term}_matches={sum(term.lower() in n.lower() for n in names)}\n")
+          PY
+
+      - name: Build audit summary and upload reports
+        if: always()
+        run: |
+          {
+            echo "FULL AUDIT SUMMARY"
+            echo "GSI properties:"
+            cat reports/gsi-android-properties.txt 2>/dev/null || true
+            echo
+            echo "Stock identifiers:"
+            cat reports/stock-manifest-identifiers.txt 2>/dev/null | head -n 120 || true
+            echo
+            echo "Stock selected images:"
+            cat reports/stock-selected-images.txt 2>/dev/null || true
+            echo
+            echo "GApps summary:"
+            cat reports/gapps-package-summary.txt 2>/dev/null || true
+            echo
+            echo "GApps installer hits:"
+            cat reports/gapps-installer-and-metadata-hits.txt 2>/dev/null | head -n 150 || true
+          } > reports/AUDIT-SUMMARY.txt
+
+      - name: Upload complete audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onefusion-full-compatibility-audit
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
